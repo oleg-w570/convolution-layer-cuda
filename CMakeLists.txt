@@ -1,10 +1,21 @@
-cmake_minimum_required(VERSION 3.29)
-project(convolution_layer LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.10)
 
-set(CMAKE_CXX_STANDARD 23)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+project(ConvolutionLayer LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED True)
+
+set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS} -gencode arch=compute_61,code=sm_61")
 
 find_package(OpenMP REQUIRED)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
+find_package(CUDAToolkit REQUIRED)
 
-add_executable(convolution_layer main.cpp)
+set(CMAKE_CUDA_ARCHITECTURES 61)
+
+add_executable(convolution_layer main.cu)
+
+target_compile_options(convolution_layer PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${OpenMP_CXX_FLAGS}>)
+target_compile_options(convolution_layer PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${OpenMP_CXX_FLAGS}>)
+target_link_libraries(convolution_layer PUBLIC OpenMP::OpenMP_CXX)
+
+target_link_libraries(convolution_layer PRIVATE CUDA::cudart)
