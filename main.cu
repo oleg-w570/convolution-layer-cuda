@@ -76,7 +76,7 @@ Batch convLayerPar(const Batch &input_batch, const Matrix &filter,
   Batch output_batch(m);
 
 #pragma omp parallel for
-  for (size_t b = 0; b < m; ++b) {
+  for (int b = 0; b < m; ++b) {
     const auto &input_matrix = input_batch[b];
     Matrix output_matrix;
     output_matrix.reserve(c * c);
@@ -120,11 +120,11 @@ d_Batch batchToDevice(const Batch &batch) {
   return d_batch;
 }
 
-d_Batch initDeviceBatch(const size_t batch_size, const size_t n) {
-  const auto matrix_size = n * n * sizeof(float);
+d_Batch initDeviceBatch(const size_t batch_size, const size_t c) {
+  const auto matrix_size = c * c * sizeof(float);
   d_Batch d_batch(batch_size);
 
-  for (auto d_matrix : d_batch) {
+  for (auto &d_matrix : d_batch) {
     cudaMalloc(reinterpret_cast<void **>(&d_matrix), matrix_size);
   }
 
@@ -132,18 +132,18 @@ d_Batch initDeviceBatch(const size_t batch_size, const size_t n) {
 }
 
 void freeDeviceBatch(const d_Batch &d_batch) {
-  for (auto d_matrix : d_batch) {
+  for (auto &d_matrix : d_batch) {
     cudaFree(d_matrix);
   }
 }
 
-Batch batchToHost(const d_Batch &d_batch, const size_t n) {
+Batch batchToHost(const d_Batch &d_batch, const size_t c) {
   Batch batch;
   batch.reserve(d_batch.size());
 
   for (const auto &d_matrix : d_batch) {
-    Matrix matrix(n * n);
-    cudaMemcpy(matrix.data(), d_matrix, n * n * sizeof(float),
+    Matrix matrix(c * c);
+    cudaMemcpy(matrix.data(), d_matrix, c * c * sizeof(float),
                cudaMemcpyDeviceToHost);
     batch.emplace_back(std::move(matrix));
   }
@@ -154,10 +154,11 @@ Batch batchToHost(const d_Batch &d_batch, const size_t n) {
 __global__ void convLayerKernel(const float *input_matrix, float *output_matrix,
                                 const float *filter, const size_t n,
                                 const size_t c, const size_t k) {
-  extern __shared__ float filter_cache[];
-  for (auto i = threadIdx.x; i < k * k; i += blockDim.x) {
-    filter_cache[i] = filter[i];
-  }
+  // extern __shared__ float filter_cache[];
+  // for (auto i = threadIdx.x; i < k * k; i += blockDim.x) {
+  //   filter_cache[i] = filter[i];
+  // }
+  // __syncthreads();
 
   const auto row = blockIdx.x;
   const auto col = threadIdx.x;
@@ -165,7 +166,7 @@ __global__ void convLayerKernel(const float *input_matrix, float *output_matrix,
   float val = 0.0f;
   for (size_t e = 0; e < k; ++e) {
     for (size_t f = 0; f < k; ++f) {
-      val += filter_cache[e * k + f] * input_matrix[(row + e) * n + col + f];
+      val += filter[e * k + f] * input_matrix[(row + e) * n + col + f];
     }
   }
   output_matrix[row * c + col] = val;
@@ -175,12 +176,12 @@ std::pair<Batch, float> convLayerCuda(const Batch &input_batch,
                                       const Matrix &filter, const size_t m,
                                       const size_t n, const size_t k) {
   const auto c = n - k + 1;
-  auto d_input_batch = batchToDevice(input_batch);
-  auto d_filter = matrixToDevice(filter);
-  auto d_output_batch = initDeviceBatch(m, c);
+  const auto d_input_batch = batchToDevice(input_batch);
+  const auto d_filter = matrixToDevice(filter);
+  const auto d_output_batch = initDeviceBatch(m, c);
 
-  const auto blocks_per_grid = n;
-  const auto threads_per_block = n;
+  const auto blocks_per_grid = c;
+  const auto threads_per_block = c;
   const auto shared_memory_size = k * k * sizeof(float);
 
   cudaEvent_t start, stop;
@@ -191,13 +192,12 @@ std::pair<Batch, float> convLayerCuda(const Batch &input_batch,
 
   for (size_t i = 0; i < m; ++i) {
     convLayerKernel<<<static_cast<unsigned>(blocks_per_grid),
-                      static_cast<unsigned>(threads_per_block),
-                      shared_memory_size>>>(d_input_batch[i], d_output_batch[i],
-                                            d_filter, n, c, k);
+                      static_cast<unsigned>(threads_per_block)>>>(
+        d_input_batch[i], d_output_batch[i], d_filter, n, c, k);
   }
 
-  cudaEventSynchronize(stop);
   cudaEventRecord(stop);
+  cudaEventSynchronize(stop);
 
   float sec = 0.0f;
   cudaEventElapsedTime(&sec, start, stop);
@@ -206,7 +206,7 @@ std::pair<Batch, float> convLayerCuda(const Batch &input_batch,
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
 
-  const auto output_batch = batchToHost(d_output_batch, n);
+  const auto output_batch = batchToHost(d_output_batch, n - k + 1);
 
   freeDeviceBatch(d_input_batch);
   freeDeviceBatch(d_output_batch);
@@ -261,25 +261,26 @@ int main(int argc, char *argv[]) {
     const auto seq_start = omp_get_wtime();
     const auto seq_result = convLayerSeq(batch, filter, m, n, k);
     const auto seq_end = omp_get_wtime();
-    std::cout << "Sequential time: " << seq_end - seq_start << std::endl;
-    print_result(seq_result, n);
+    std::cout << "Sequential time: " << seq_end - seq_start << " sec."
+              << std::endl;
+    // print_result(seq_result, n - k + 1);
 
     {
-      const auto par_start = omp_get_wtime();
-      const auto par_result = convLayerPar(batch, filter, m, n, k);
-      const auto par_end = omp_get_wtime();
-      std::cout << "Parallel time: " << par_end - par_start << " ";
-      std::cout << "(diff: " << maxDifference(seq_result, par_result) << ")"
-                << std::endl;
+      // const auto par_start = omp_get_wtime();
+      // const auto par_result = convLayerPar(batch, filter, m, n, k);
+      // const auto par_end = omp_get_wtime();
+      // std::cout << "Parallel time: " << par_end - par_start << " sec. ";
+      // std::cout << "(diff: " << maxDifference(seq_result, par_result) << ")"
+      //           << std::endl;
     }
 
     {
       const auto [cuda_result, cuda_time] =
           convLayerCuda(batch, filter, m, n, k);
-      std::cout << "Cuda time: " << cuda_time << " ";
+      std::cout << "Cuda time: " << cuda_time << " sec. ";
       std::cout << "(diff: " << maxDifference(seq_result, cuda_result) << ")"
                 << std::endl;
-      print_result(cuda_result, n);
+      // print_result(cuda_result, n - k + 1);
     }
 
   } catch (const std::bad_alloc &e) {
