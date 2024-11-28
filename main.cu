@@ -3,6 +3,7 @@
 #include <omp.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <iostream>
 #include <random>
@@ -10,19 +11,29 @@
 #include <utility>
 #include <vector>
 
+#define CHECK_CUDA_ERROR(call)                                                                                       \
+  {                                                                                                                  \
+    cudaError_t err = call;                                                                                          \
+    if (err != cudaSuccess) {                                                                                        \
+      std::cerr << "CUDA error in " << __FILE__ << ":" << __LINE__ << " : " << cudaGetErrorString(err) << std::endl; \
+      exit(EXIT_FAILURE);                                                                                            \
+    }                                                                                                                \
+  }
+
 using Matrix = std::vector<float>;
 using Batch = std::vector<Matrix>;
-using d_Batch = std::vector<float *>;
 
-Matrix generateRandomMatrix(const size_t n) {
+constexpr size_t BLOCK_SIZE = 32;
+
+Matrix generateRandomMatrix(const size_t rows, const size_t cols) {
   static std::random_device rd;
   static std::mt19937 rng(rd());
-  std::uniform_real_distribution<float> dis(0.0f, 1.0f);
+  std::uniform_real_distribution dis(0.0f, 1.0f);
 
   Matrix matrix;
-  matrix.reserve(n * n);
+  matrix.reserve(rows * cols);
 
-  for (size_t i = 0; i < n * n; ++i) {
+  for (size_t i = 0; i < rows * cols; ++i) {
     // matrix.emplace_back(dis(rng));
     matrix.emplace_back(1);
   }
@@ -30,25 +41,27 @@ Matrix generateRandomMatrix(const size_t n) {
   return matrix;
 }
 
-Batch generateRandomBatch(const size_t m, const size_t n) {
+Batch generateRandomBatch(const size_t batch_size, const size_t matrix_rows, const size_t matrix_cols) {
   Batch batch;
-  batch.reserve(m);
+  batch.reserve(batch_size);
 
-  for (size_t i = 0; i < m; ++i) {
-    batch.emplace_back(generateRandomMatrix(n));
+  for (size_t i = 0; i < batch_size; ++i) {
+    batch.emplace_back(generateRandomMatrix(matrix_rows, matrix_cols));
   }
 
   return batch;
 }
 
-Batch convLayerSeq(const Batch &input_batch, const Matrix &filter,
-                   const size_t m, const size_t n, const size_t k) {
+Batch convLayerSeq(const Batch &inputs, const Batch &filters, const size_t m, const size_t n, const size_t k) {
   const auto c = n - k + 1;
 
   Batch output_batch;
   output_batch.reserve(m);
 
-  for (const auto &input_matrix : input_batch) {
+  for (size_t batch_i = 0; batch_i < m; ++batch_i) {
+    const auto &input_matrix = inputs[batch_i];
+    const auto &filter = filters[batch_i];
+
     Matrix output_matrix;
     output_matrix.reserve(c * c);
 
@@ -70,14 +83,15 @@ Batch convLayerSeq(const Batch &input_batch, const Matrix &filter,
   return output_batch;
 }
 
-Batch convLayerPar(const Batch &input_batch, const Matrix &filter,
-                   const size_t m, const size_t n, const size_t k) {
+Batch convLayerPar(const Batch &inputs, const Batch &filters, const size_t m, const size_t n, const size_t k) {
   const auto c = n - k + 1;
   Batch output_batch(m);
 
 #pragma omp parallel for
-  for (int b = 0; b < m; ++b) {
-    const auto &input_matrix = input_batch[b];
+  for (int batch_i = 0; batch_i < m; ++batch_i) {
+    const auto &input_matrix = inputs[batch_i];
+    const auto &filter = filters[batch_i];
+
     Matrix output_matrix;
     output_matrix.reserve(c * c);
 
@@ -93,126 +107,10 @@ Batch convLayerPar(const Batch &input_batch, const Matrix &filter,
       }
     }
 
-    output_batch[b] = std::move(output_matrix);
+    output_batch[batch_i] = std::move(output_matrix);
   }
 
   return output_batch;
-}
-
-float *matrixToDevice(const Matrix &matrix) {
-  const auto matrix_size = matrix.size() * sizeof(float);
-  float *d_matrix = nullptr;
-
-  cudaMalloc(reinterpret_cast<void **>(&d_matrix), matrix_size);
-  cudaMemcpy(d_matrix, matrix.data(), matrix_size, cudaMemcpyHostToDevice);
-
-  return d_matrix;
-}
-
-d_Batch batchToDevice(const Batch &batch) {
-  d_Batch d_batch;
-  d_batch.reserve(batch.size());
-
-  for (const auto &matrix : batch) {
-    d_batch.emplace_back(matrixToDevice(matrix));
-  }
-
-  return d_batch;
-}
-
-d_Batch initDeviceBatch(const size_t batch_size, const size_t c) {
-  const auto matrix_size = c * c * sizeof(float);
-  d_Batch d_batch(batch_size);
-
-  for (auto &d_matrix : d_batch) {
-    cudaMalloc(reinterpret_cast<void **>(&d_matrix), matrix_size);
-  }
-
-  return d_batch;
-}
-
-void freeDeviceBatch(const d_Batch &d_batch) {
-  for (auto &d_matrix : d_batch) {
-    cudaFree(d_matrix);
-  }
-}
-
-Batch batchToHost(const d_Batch &d_batch, const size_t c) {
-  Batch batch;
-  batch.reserve(d_batch.size());
-
-  for (const auto &d_matrix : d_batch) {
-    Matrix matrix(c * c);
-    cudaMemcpy(matrix.data(), d_matrix, c * c * sizeof(float),
-               cudaMemcpyDeviceToHost);
-    batch.emplace_back(std::move(matrix));
-  }
-
-  return batch;
-}
-
-__global__ void convLayerKernel(const float *input_matrix, float *output_matrix,
-                                const float *filter, const size_t n,
-                                const size_t c, const size_t k) {
-  // extern __shared__ float filter_cache[];
-  // for (auto i = threadIdx.x; i < k * k; i += blockDim.x) {
-  //   filter_cache[i] = filter[i];
-  // }
-  // __syncthreads();
-
-  const auto row = blockIdx.x;
-  const auto col = threadIdx.x;
-
-  float val = 0.0f;
-  for (size_t e = 0; e < k; ++e) {
-    for (size_t f = 0; f < k; ++f) {
-      val += filter[e * k + f] * input_matrix[(row + e) * n + col + f];
-    }
-  }
-  output_matrix[row * c + col] = val;
-}
-
-std::pair<Batch, float> convLayerCuda(const Batch &input_batch,
-                                      const Matrix &filter, const size_t m,
-                                      const size_t n, const size_t k) {
-  const auto c = n - k + 1;
-  const auto d_input_batch = batchToDevice(input_batch);
-  const auto d_filter = matrixToDevice(filter);
-  const auto d_output_batch = initDeviceBatch(m, c);
-
-  const auto blocks_per_grid = c;
-  const auto threads_per_block = c;
-  const auto shared_memory_size = k * k * sizeof(float);
-
-  cudaEvent_t start, stop;
-  cudaEventCreate(&start);
-  cudaEventCreate(&stop);
-
-  cudaEventRecord(start);
-
-  for (size_t i = 0; i < m; ++i) {
-    convLayerKernel<<<static_cast<unsigned>(blocks_per_grid),
-                      static_cast<unsigned>(threads_per_block)>>>(
-        d_input_batch[i], d_output_batch[i], d_filter, n, c, k);
-  }
-
-  cudaEventRecord(stop);
-  cudaEventSynchronize(stop);
-
-  float sec = 0.0f;
-  cudaEventElapsedTime(&sec, start, stop);
-  sec /= 1000.0f;
-
-  cudaEventDestroy(start);
-  cudaEventDestroy(stop);
-
-  const auto output_batch = batchToHost(d_output_batch, n - k + 1);
-
-  freeDeviceBatch(d_input_batch);
-  freeDeviceBatch(d_output_batch);
-  cudaFree(d_filter);
-
-  return {output_batch, sec};
 }
 
 float maxDifference(const Batch &batch1, const Batch &batch2) {
@@ -233,21 +131,197 @@ float maxDifference(const Batch &batch1, const Batch &batch2) {
   return max_difference;
 }
 
-void print_result(const Batch &batch, const size_t n) {
-  const Matrix &matrix = batch[0];
+void check_result(const Batch &batch) {
+  auto count_incorrect = 0;
+  const auto val = batch.front().front();
 
-  for (size_t i = 0; i < n; ++i) {
-    for (size_t j = 0; j < n; ++j) {
-      std::cout << matrix[i * n + j] << " ";
+  for (const auto &matrix : batch) {
+    for (const auto &v : matrix) {
+      if (std::abs(v - val) > 1e-6) {
+        ++count_incorrect;
+      }
     }
-    std::cout << std::endl;
   }
+
+  std::cout << "Value: " << val << std::endl;
+  std::cout << "Incorrect values: " << count_incorrect << std::endl;
+}
+
+__global__ void convLayerKernel(const float *input, const float *filter, float *output, const size_t n, const size_t k,
+                                const size_t c) {
+  __shared__ float filter_cache[BLOCK_SIZE * BLOCK_SIZE];
+
+  auto sum = 0.0f;
+  const auto out_col = blockIdx.x * blockDim.x + threadIdx.x;
+  const auto out_row = blockIdx.y * blockDim.y + threadIdx.y;
+  const auto valid_thread = out_row < c && out_col < c;
+  const auto tid = threadIdx.y * blockDim.x + threadIdx.x;
+  const auto num_blocks = (k + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+  for (size_t block_i = 0; block_i < num_blocks; ++block_i) {
+    for (size_t block_j = 0; block_j < num_blocks; ++block_j) {
+      const auto filter_i = block_i * BLOCK_SIZE + threadIdx.y;
+      const auto filter_j = block_j * BLOCK_SIZE + threadIdx.x;
+      filter_cache[tid] = filter_i < k && filter_j < k ? filter[filter_i * k + filter_j] : 0.0f;
+      __syncthreads();
+
+      const auto valid_cache_rows = min(BLOCK_SIZE, k - block_i * BLOCK_SIZE);
+      const auto valid_cache_cols = min(BLOCK_SIZE, k - block_j * BLOCK_SIZE);
+
+      for (size_t cache_i = 0; cache_i < valid_cache_rows; ++cache_i) {
+        for (size_t cache_j = 0; cache_j < valid_cache_cols; ++cache_j) {
+          const auto e = block_i * BLOCK_SIZE + cache_i;
+          const auto f = block_j * BLOCK_SIZE + cache_j;
+          if (valid_thread) {
+            sum += filter_cache[cache_i * BLOCK_SIZE + cache_j] * input[(out_row + e) * n + out_col + f];
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+
+  if (valid_thread) {
+    output[out_row * c + out_col] = sum;
+  }
+}
+
+auto convLayerCudaSingle(const Batch &inputs, const Batch &filters, const size_t m, const size_t n, const size_t k) {
+  const auto c = n - k + 1;
+  const auto input_size = n * n * sizeof(float);
+  const auto filter_size = k * k * sizeof(float);
+  const auto output_size = c * c * sizeof(float);
+
+  Batch outputs(m, Matrix(c * c));
+
+  dim3 threads_per_block(BLOCK_SIZE, BLOCK_SIZE);
+  dim3 blocks_per_grid((c + BLOCK_SIZE - 1) / BLOCK_SIZE, (c + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+  cudaEvent_t start, stop;
+  CHECK_CUDA_ERROR(cudaEventCreate(&start));
+  CHECK_CUDA_ERROR(cudaEventCreate(&stop));
+
+  CHECK_CUDA_ERROR(cudaEventRecord(start));
+
+  for (size_t batch_i = 0; batch_i < m; ++batch_i) {
+    const auto &input = inputs[batch_i];
+    const auto &filter = filters[batch_i];
+    auto &output = outputs[batch_i];
+
+    float *d_input = nullptr;
+    float *d_filter = nullptr;
+    float *d_output = nullptr;
+
+    CHECK_CUDA_ERROR(cudaMalloc(&d_input, input_size));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_filter, filter_size));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_output, output_size));
+
+    CHECK_CUDA_ERROR(cudaMemcpy(d_input, input.data(), input_size, cudaMemcpyHostToDevice));
+    CHECK_CUDA_ERROR(cudaMemcpy(d_filter, filter.data(), filter_size, cudaMemcpyHostToDevice));
+
+    convLayerKernel<<<blocks_per_grid, threads_per_block>>>(d_input, d_filter, d_output, n, k, c);
+
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    CHECK_CUDA_ERROR(cudaDeviceSynchronize());
+
+    CHECK_CUDA_ERROR(cudaMemcpy(output.data(), d_output, output_size, cudaMemcpyDeviceToHost));
+
+    CHECK_CUDA_ERROR(cudaFree(d_output));
+    CHECK_CUDA_ERROR(cudaFree(d_filter));
+    CHECK_CUDA_ERROR(cudaFree(d_input));
+  }
+
+  CHECK_CUDA_ERROR(cudaEventRecord(stop));
+  CHECK_CUDA_ERROR(cudaEventSynchronize(stop));
+
+  float execution_time = 0.0f;
+  CHECK_CUDA_ERROR(cudaEventElapsedTime(&execution_time, start, stop));
+  execution_time /= 1000.0f;
+
+  CHECK_CUDA_ERROR(cudaEventDestroy(stop));
+  CHECK_CUDA_ERROR(cudaEventDestroy(start));
+
+  return std::make_pair(outputs, execution_time);
+}
+
+auto convLayerCudaStreams(const Batch &inputs, const Batch &filters, const size_t n, const size_t m, const size_t k) {
+  const auto c = n - k + 1;
+  const auto input_size = n * n * sizeof(float);
+  const auto filter_size = k * k * sizeof(float);
+  const auto output_size = c * c * sizeof(float);
+
+  Batch outputs(m, Matrix(c * c));
+
+  dim3 threads_per_block(BLOCK_SIZE, BLOCK_SIZE);
+  dim3 blocks_per_grid((c + BLOCK_SIZE - 1) / BLOCK_SIZE, (c + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+  constexpr size_t num_streams = 4;
+  std::array<cudaStream_t, num_streams> streams{};
+  for (size_t s = 0; s < num_streams; ++s) {
+    CHECK_CUDA_ERROR(cudaStreamCreate(&streams[s]));
+  }
+
+  const auto batch_size_per_stream = (m + num_streams - 1) / num_streams;
+
+  cudaEvent_t start, stop;
+  CHECK_CUDA_ERROR(cudaEventCreate(&start));
+  CHECK_CUDA_ERROR(cudaEventCreate(&stop));
+
+  CHECK_CUDA_ERROR(cudaEventRecord(start));
+
+  for (size_t s = 0; s < num_streams; ++s) {
+    const auto &stream = streams[s];
+    const auto batch_start = s * batch_size_per_stream;
+    const auto batch_end = min(batch_start + batch_size_per_stream, m);
+
+    for (auto batch_i = batch_start; batch_i < batch_end; ++batch_i) {
+      const auto &input = inputs[batch_i];
+      const auto &filter = filters[batch_i];
+      auto &output = outputs[batch_i];
+
+      float *d_input = nullptr;
+      float *d_filter = nullptr;
+      float *d_output = nullptr;
+
+      CHECK_CUDA_ERROR(cudaMallocAsync(&d_input, input_size, stream));
+      CHECK_CUDA_ERROR(cudaMallocAsync(&d_filter, filter_size, stream));
+      CHECK_CUDA_ERROR(cudaMallocAsync(&d_output, output_size, stream));
+
+      CHECK_CUDA_ERROR(cudaMemcpyAsync(d_input, input.data(), input_size, cudaMemcpyHostToDevice, stream));
+      CHECK_CUDA_ERROR(cudaMemcpyAsync(d_filter, filter.data(), filter_size, cudaMemcpyHostToDevice, stream));
+
+      convLayerKernel<<<blocks_per_grid, threads_per_block, 0, stream>>>(d_input, d_filter, d_output, n, k, c);
+      CHECK_CUDA_ERROR(cudaGetLastError());
+
+      CHECK_CUDA_ERROR(cudaMemcpyAsync(output.data(), d_output, output_size, cudaMemcpyDeviceToHost, stream));
+
+      CHECK_CUDA_ERROR(cudaFreeAsync(d_output, stream));
+      CHECK_CUDA_ERROR(cudaFreeAsync(d_filter, stream));
+      CHECK_CUDA_ERROR(cudaFreeAsync(d_input, stream));
+    }
+  }
+
+  for (size_t s = 0; s < num_streams; ++s) {
+    CHECK_CUDA_ERROR(cudaStreamSynchronize(streams[s]));
+    CHECK_CUDA_ERROR(cudaStreamDestroy(streams[s]));
+  }
+
+  CHECK_CUDA_ERROR(cudaEventRecord(stop));
+  CHECK_CUDA_ERROR(cudaEventSynchronize(stop));
+
+  float execution_time = 0.0f;
+  CHECK_CUDA_ERROR(cudaEventElapsedTime(&execution_time, start, stop));
+  execution_time /= 1000.0f;
+
+  CHECK_CUDA_ERROR(cudaEventDestroy(stop));
+  CHECK_CUDA_ERROR(cudaEventDestroy(start));
+
+  return std::make_pair(outputs, execution_time);
 }
 
 int main(int argc, char *argv[]) {
   if (argc != 4) {
-    std::cerr << "Usage: " << argv[0]
-              << " <matrix_size> <filter_size> <batch_size>" << std::endl;
+    std::cerr << "Usage: " << argv[0] << " <matrix_size> <filter_size> <batch_size>" << std::endl;
     return 1;
   }
   const auto n = std::stoull(argv[1]);
@@ -255,16 +329,14 @@ int main(int argc, char *argv[]) {
   const auto m = std::stoull(argv[3]);
 
   try {
-    const auto batch = generateRandomBatch(m, n);
-    const auto filter = generateRandomMatrix(k);
+    const auto inputs = generateRandomBatch(m, n, n);
+    const auto filters = generateRandomBatch(m, k, k);
 
-    const auto seq_start = omp_get_wtime();
-    const auto seq_result = convLayerSeq(batch, filter, m, n, k);
-    const auto seq_end = omp_get_wtime();
-    std::cout << "Sequential time: " << seq_end - seq_start << " sec."
-              << std::endl;
-    // print_result(seq_result, n - k + 1);
-
+    // const auto seq_start = omp_get_wtime();
+    // const auto seq_result = convLayerSeq(inputs, filters, m, n, k);
+    // const auto seq_end = omp_get_wtime();
+    // std::cout << "Sequential time: " << seq_end - seq_start << " sec."
+    //           << std::endl;
     {
       // const auto par_start = omp_get_wtime();
       // const auto par_result = convLayerPar(batch, filter, m, n, k);
@@ -275,12 +347,17 @@ int main(int argc, char *argv[]) {
     }
 
     {
-      const auto [cuda_result, cuda_time] =
-          convLayerCuda(batch, filter, m, n, k);
-      std::cout << "Cuda time: " << cuda_time << " sec. ";
-      std::cout << "(diff: " << maxDifference(seq_result, cuda_result) << ")"
-                << std::endl;
-      // print_result(cuda_result, n - k + 1);
+      const auto [cuda_result, cuda_time] = convLayerCudaSingle(inputs, filters, m, n, k);
+      std::cout << "Cuda (Single) time: " << cuda_time << " sec. " << std::endl;
+      check_result(cuda_result);
+      // std::cout << "(diff: " << maxDifference(seq_result, cuda_result) << ")"
+      //           << std::endl;
+    }
+
+    {
+      const auto [cuda_result, cuda_time] = convLayerCudaStreams(inputs, filters, m, n, k);
+      std::cout << "Cuda (Streams) time: " << cuda_time << " sec. " << std::endl;
+      check_result(cuda_result);
     }
 
   } catch (const std::bad_alloc &e) {
