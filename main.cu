@@ -328,13 +328,13 @@ int main(int argc, char *argv[]) {
 
   {
     const auto [cuda_result, cuda_time] = convLayerCudaSingle(inputs, filters, m, n, k);
-    std::cout << "Cuda (Single) time: " << cuda_time << " sec. " << std::endl;
+    std::cout << "Cuda (Single) time: " << cuda_time << " sec. ";
     std::cout << "(diff: " << maxDifference(seq_result, cuda_result) << ")" << std::endl;
   }
 
   {
     const auto [cuda_result, cuda_time] = convLayerCudaStreams(inputs, filters, m, n, k);
-    std::cout << "Cuda (Streams) time: " << cuda_time << " sec. " << std::endl;
+    std::cout << "Cuda (Streams) time: " << cuda_time << " sec. ";
     std::cout << "(diff: " << maxDifference(seq_result, cuda_result) << ")" << std::endl;
   }
 
