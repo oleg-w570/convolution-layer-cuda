@@ -34,8 +34,7 @@ Matrix generateRandomMatrix(const size_t rows, const size_t cols) {
   matrix.reserve(rows * cols);
 
   for (size_t i = 0; i < rows * cols; ++i) {
-    // matrix.emplace_back(dis(rng));
-    matrix.emplace_back(1);
+    matrix.emplace_back(dis(rng));
   }
 
   return matrix;
@@ -88,7 +87,7 @@ Batch convLayerPar(const Batch &inputs, const Batch &filters, const size_t m, co
   Batch output_batch(m);
 
 #pragma omp parallel for
-  for (int batch_i = 0; batch_i < m; ++batch_i) {
+  for (size_t batch_i = 0; batch_i < m; ++batch_i) {
     const auto &input_matrix = inputs[batch_i];
     const auto &filter = filters[batch_i];
 
@@ -129,22 +128,6 @@ float maxDifference(const Batch &batch1, const Batch &batch2) {
   }
 
   return max_difference;
-}
-
-void check_result(const Batch &batch) {
-  auto count_incorrect = 0;
-  const auto val = batch.front().front();
-
-  for (const auto &matrix : batch) {
-    for (const auto &v : matrix) {
-      if (std::abs(v - val) > 1e-6) {
-        ++count_incorrect;
-      }
-    }
-  }
-
-  std::cout << "Value: " << val << std::endl;
-  std::cout << "Incorrect values: " << count_incorrect << std::endl;
 }
 
 __global__ void convLayerKernel(const float *input, const float *filter, float *output, const size_t n, const size_t k,
@@ -244,7 +227,7 @@ auto convLayerCudaSingle(const Batch &inputs, const Batch &filters, const size_t
   return std::make_pair(outputs, execution_time);
 }
 
-auto convLayerCudaStreams(const Batch &inputs, const Batch &filters, const size_t n, const size_t m, const size_t k) {
+auto convLayerCudaStreams(const Batch &inputs, const Batch &filters, const size_t m, const size_t n, const size_t k) {
   const auto c = n - k + 1;
   const auto input_size = n * n * sizeof(float);
   const auto filter_size = k * k * sizeof(float);
@@ -328,41 +311,31 @@ int main(int argc, char *argv[]) {
   const auto k = std::stoull(argv[2]);
   const auto m = std::stoull(argv[3]);
 
-  try {
-    const auto inputs = generateRandomBatch(m, n, n);
-    const auto filters = generateRandomBatch(m, k, k);
+  const auto inputs = generateRandomBatch(m, n, n);
+  const auto filters = generateRandomBatch(m, k, k);
 
-    // const auto seq_start = omp_get_wtime();
-    // const auto seq_result = convLayerSeq(inputs, filters, m, n, k);
-    // const auto seq_end = omp_get_wtime();
-    // std::cout << "Sequential time: " << seq_end - seq_start << " sec."
-    //           << std::endl;
-    {
-      // const auto par_start = omp_get_wtime();
-      // const auto par_result = convLayerPar(batch, filter, m, n, k);
-      // const auto par_end = omp_get_wtime();
-      // std::cout << "Parallel time: " << par_end - par_start << " sec. ";
-      // std::cout << "(diff: " << maxDifference(seq_result, par_result) << ")"
-      //           << std::endl;
-    }
+  const auto seq_start = omp_get_wtime();
+  const auto seq_result = convLayerSeq(inputs, filters, m, n, k);
+  const auto seq_end = omp_get_wtime();
+  std::cout << "Sequential time: " << seq_end - seq_start << " sec." << std::endl;
+  {
+    const auto par_start = omp_get_wtime();
+    const auto par_result = convLayerPar(inputs, filters, m, n, k);
+    const auto par_end = omp_get_wtime();
+    std::cout << "Parallel time: " << par_end - par_start << " sec. ";
+    std::cout << "(diff: " << maxDifference(seq_result, par_result) << ")" << std::endl;
+  }
 
-    {
-      const auto [cuda_result, cuda_time] = convLayerCudaSingle(inputs, filters, m, n, k);
-      std::cout << "Cuda (Single) time: " << cuda_time << " sec. " << std::endl;
-      check_result(cuda_result);
-      // std::cout << "(diff: " << maxDifference(seq_result, cuda_result) << ")"
-      //           << std::endl;
-    }
+  {
+    const auto [cuda_result, cuda_time] = convLayerCudaSingle(inputs, filters, m, n, k);
+    std::cout << "Cuda (Single) time: " << cuda_time << " sec. " << std::endl;
+    std::cout << "(diff: " << maxDifference(seq_result, cuda_result) << ")" << std::endl;
+  }
 
-    {
-      const auto [cuda_result, cuda_time] = convLayerCudaStreams(inputs, filters, m, n, k);
-      std::cout << "Cuda (Streams) time: " << cuda_time << " sec. " << std::endl;
-      check_result(cuda_result);
-    }
-
-  } catch (const std::bad_alloc &e) {
-    std::cerr << "Error alloc memory: " << e.what() << std::endl;
-    return 1;
+  {
+    const auto [cuda_result, cuda_time] = convLayerCudaStreams(inputs, filters, m, n, k);
+    std::cout << "Cuda (Streams) time: " << cuda_time << " sec. " << std::endl;
+    std::cout << "(diff: " << maxDifference(seq_result, cuda_result) << ")" << std::endl;
   }
 
   return 0;
