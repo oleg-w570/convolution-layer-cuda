@@ -20,10 +20,10 @@
     }                                                                                                                \
   }
 
+constexpr size_t BLOCK_SIZE = 32;
+
 using Matrix = std::vector<float>;
 using Batch = std::vector<Matrix>;
-
-constexpr size_t BLOCK_SIZE = 32;
 
 Matrix generateRandomMatrix(const size_t rows, const size_t cols) {
   static std::random_device rd;
@@ -51,6 +51,9 @@ Batch generateRandomBatch(const size_t batch_size, const size_t matrix_rows, con
   return batch;
 }
 
+using Matrix = std::vector<float>;
+using Batch = std::vector<Matrix>;
+
 Batch convLayerSeq(const Batch &inputs, const Batch &filters, const size_t m, const size_t n, const size_t k) {
   const auto c = n - k + 1;
 
@@ -66,7 +69,7 @@ Batch convLayerSeq(const Batch &inputs, const Batch &filters, const size_t m, co
 
     for (size_t i = 0; i < c; ++i) {
       for (size_t j = 0; j < c; ++j) {
-        float val = 0.0f;
+        auto val = 0.0f;
         for (size_t e = 0; e < k; ++e) {
           for (size_t f = 0; f < k; ++f) {
             val += filter[e * k + f] * input_matrix[(i + e) * n + j + f];
@@ -84,29 +87,27 @@ Batch convLayerSeq(const Batch &inputs, const Batch &filters, const size_t m, co
 
 Batch convLayerPar(const Batch &inputs, const Batch &filters, const size_t m, const size_t n, const size_t k) {
   const auto c = n - k + 1;
-  Batch output_batch(m);
+  Batch output_batch(m, Matrix(c * c));
 
 #pragma omp parallel for
-  for (size_t batch_i = 0; batch_i < m; ++batch_i) {
+  for (int idx = 0; idx < m * c * c; ++idx) {
+    const auto batch_i = idx / (c * c);
+    const auto ij = idx % (c * c);
+    const auto i = ij / c;
+    const auto j = ij % c;
+
     const auto &input_matrix = inputs[batch_i];
     const auto &filter = filters[batch_i];
+    auto &output_matrix = output_batch[batch_i];
 
-    Matrix output_matrix;
-    output_matrix.reserve(c * c);
-
-    for (size_t i = 0; i < c; ++i) {
-      for (size_t j = 0; j < c; ++j) {
-        float val = 0.0f;
-        for (size_t e = 0; e < k; ++e) {
-          for (size_t f = 0; f < k; ++f) {
-            val += filter[e * k + f] * input_matrix[(i + e) * n + j + f];
-          }
-        }
-        output_matrix.emplace_back(val);
+    auto val = 0.0f;
+    for (size_t e = 0; e < k; ++e) {
+      for (size_t f = 0; f < k; ++f) {
+        val += filter[e * k + f] * input_matrix[(i + e) * n + j + f];
       }
     }
 
-    output_batch[batch_i] = std::move(output_matrix);
+    output_matrix[i * c + j] = val;
   }
 
   return output_batch;
@@ -134,12 +135,12 @@ __global__ void convLayerKernel(const float *input, const float *filter, float *
                                 const size_t c) {
   __shared__ float filter_cache[BLOCK_SIZE * BLOCK_SIZE];
 
-  auto sum = 0.0f;
   const auto out_col = blockIdx.x * blockDim.x + threadIdx.x;
   const auto out_row = blockIdx.y * blockDim.y + threadIdx.y;
-  const auto valid_thread = out_row < c && out_col < c;
+  const auto is_valid_thread = out_row < c && out_col < c;
   const auto tid = threadIdx.y * blockDim.x + threadIdx.x;
   const auto num_blocks = (k + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  auto val = 0.0f;
 
   for (size_t block_i = 0; block_i < num_blocks; ++block_i) {
     for (size_t block_j = 0; block_j < num_blocks; ++block_j) {
@@ -155,8 +156,8 @@ __global__ void convLayerKernel(const float *input, const float *filter, float *
         for (size_t cache_j = 0; cache_j < valid_cache_cols; ++cache_j) {
           const auto e = block_i * BLOCK_SIZE + cache_i;
           const auto f = block_j * BLOCK_SIZE + cache_j;
-          if (valid_thread) {
-            sum += filter_cache[cache_i * BLOCK_SIZE + cache_j] * input[(out_row + e) * n + out_col + f];
+          if (is_valid_thread) {
+            val += filter_cache[cache_i * BLOCK_SIZE + cache_j] * input[(out_row + e) * n + out_col + f];
           }
         }
       }
@@ -164,8 +165,8 @@ __global__ void convLayerKernel(const float *input, const float *filter, float *
     }
   }
 
-  if (valid_thread) {
-    output[out_row * c + out_col] = sum;
+  if (is_valid_thread) {
+    output[out_row * c + out_col] = val;
   }
 }
 
@@ -217,7 +218,7 @@ auto convLayerCudaSingle(const Batch &inputs, const Batch &filters, const size_t
   CHECK_CUDA_ERROR(cudaEventRecord(stop));
   CHECK_CUDA_ERROR(cudaEventSynchronize(stop));
 
-  float execution_time = 0.0f;
+  auto execution_time = 0.0f;
   CHECK_CUDA_ERROR(cudaEventElapsedTime(&execution_time, start, stop));
   execution_time /= 1000.0f;
 
@@ -292,7 +293,7 @@ auto convLayerCudaStreams(const Batch &inputs, const Batch &filters, const size_
   CHECK_CUDA_ERROR(cudaEventRecord(stop));
   CHECK_CUDA_ERROR(cudaEventSynchronize(stop));
 
-  float execution_time = 0.0f;
+  auto execution_time = 0.0f;
   CHECK_CUDA_ERROR(cudaEventElapsedTime(&execution_time, start, stop));
   execution_time /= 1000.0f;
 
